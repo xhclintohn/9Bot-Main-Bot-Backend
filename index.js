@@ -77,7 +77,7 @@ app.post('/pair', async (req, res) => {
 
     // Validate phone number format
     const cleanPhone = phoneNumber.replace(/[^0-9]/g, '');
-    if (!cleanPhone.startsWith('62')) {
+    if (!cleanPhone.startsWith('254')) {
       return res.status(400).json({
         success: false,
         error: 'Phone number must start with 62 (Indonesia)'
