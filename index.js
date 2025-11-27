@@ -7,7 +7,7 @@ const cors = require('cors');
 const simpleGit = require('simple-git');
 
 const {
-  default: Toxic_Tech,
+  default: makeWASocket,
   useMultiFileAuthState,
   delay,
   makeCacheableSignalKeyStore,
@@ -162,7 +162,7 @@ app.get('/', (req, res) => {
   });
 });
 
-// Pairing endpoint
+// Pairing endpoint - USING EXACT BAILEYS DOCUMENTATION APPROACH
 app.post('/pair', async (req, res) => {
   console.log('📞 Pairing request received:', req.body);
   
@@ -193,82 +193,82 @@ app.post('/pair', async (req, res) => {
 
   console.log(`🔐 Starting pairing for user: ${userId}`);
 
-  async function startPairing() {
-    try {
-      const { version } = await fetchLatestBaileysVersion();
-      const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
+  try {
+    // Use MultiFileAuthState as per documentation
+    const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
+    
+    // Create socket with auth state as per documentation
+    const sock = makeWASocket({
+      printQRInTerminal: false, // as per documentation
+      auth: state, // as per documentation
+      logger: pino({ level: 'fatal' }),
+      browser: Browsers.ubuntu('Chrome'),
+    });
 
-      const sock = Toxic_Tech({
-        version,
-        logger: pino({ level: 'fatal' }),
-        printQRInTerminal: false,
-        auth: {
-          creds: state.creds,
-          keys: makeCacheableSignalKeyStore(state.keys, pino({ level: 'fatal' })),
-        },
-        browser: Browsers.ubuntu('Chrome'),
-        syncFullHistory: false,
+    // Listen for creds updates as per documentation
+    sock.ev.on('creds.update', saveCreds);
+
+    // Store session
+    activeSessions.set(sessionId, {
+      sock,
+      saveCreds,
+      sessionPath,
+      userId,
+      connected: false
+    });
+
+    // === Pairing Code Generation - EXACT DOCUMENTATION APPROACH ===
+    if (!sock.authState.creds.registered) {
+      console.log(`📱 Requesting pairing code for: ${cleanPhone}`);
+      
+      // Request pairing code as per documentation
+      const code = await sock.requestPairingCode(cleanPhone);
+      console.log(`✅ Pairing code generated: ${code} for user: ${userId}`);
+      
+      // Send response immediately
+      res.json({ 
+        success: true, 
+        pairingCode: code,
+        sessionId: sessionId,
+        message: 'Enter this code in WhatsApp Linked Devices → Link a Device'
       });
 
-      // Store session
-      activeSessions.set(sessionId, {
-        sock,
-        saveCreds,
-        sessionPath,
-        userId,
-        connected: false
-      });
-
-      // === Pairing Code Generation ===
-      if (!sock.authState.creds.registered) {
-        await delay(1500);
-        console.log(`📱 Requesting pairing code for: ${cleanPhone}`);
-        
-        const code = await sock.requestPairingCode(cleanPhone);
-        console.log(`✅ Pairing code generated: ${code} for user: ${userId}`);
-        
-        if (!res.headersSent) {
-          res.json({ 
-            success: true, 
-            pairingCode: code,
-            message: 'Enter this code in WhatsApp Linked Devices → Link a Device'
-          });
-        }
-      }
-
-      sock.ev.on('creds.update', saveCreds);
-
-      sock.ev.on('connection.update', async ({ connection, lastDisconnect }) => {
-        console.log(`🔗 Connection update for ${userId}: ${connection}`);
-        
-        if (connection === 'open') {
-          console.log(`🎉 USER ${userId} SUCCESSFULLY CONNECTED!`);
+      // Wait for connection
+      console.log(`⏳ Waiting for user ${userId} to connect...`);
+      
+      return new Promise((resolve) => {
+        sock.ev.on('connection.update', async (update) => {
+          const { connection } = update;
+          console.log(`🔗 Connection update for ${userId}: ${connection}`);
           
-          const session = activeSessions.get(sessionId);
-          if (session) session.connected = true;
+          if (connection === 'open') {
+            console.log(`🎉 USER ${userId} SUCCESSFULLY CONNECTED!`);
+            
+            const session = activeSessions.get(sessionId);
+            if (session) session.connected = true;
 
-          // Send welcome message
-          await sock.sendMessage(sock.user.id, {
-            text: `
+            try {
+              // Send welcome message
+              await sock.sendMessage(sock.user.id, {
+                text: `
 ◈━━━━━━━━━━━━━━━━◈
 │❒ Hello! 👋 You're now connected to Toxic-MD.
 
 │❒ Saving your session and deploying bot...
 │❒ Please wait a moment! 🙂
 ◈━━━━━━━━━━━━━━━━◈
-            `
-          });
+                `
+              });
 
-          await delay(3000);
+              await delay(3000);
 
-          try {
-            // Save to GitHub and deploy
-            console.log(`💾 Starting GitHub save for ${userId}...`);
-            await saveToGitHubAndDeploy(sessionPath, userId, cleanPhone);
-            
-            // Send success message
-            await sock.sendMessage(sock.user.id, {
-              text: `
+              // Save to GitHub and deploy
+              console.log(`💾 Starting GitHub save for ${userId}...`);
+              await saveToGitHubAndDeploy(sessionPath, userId, cleanPhone);
+              
+              // Send success message
+              await sock.sendMessage(sock.user.id, {
+                text: `
 ◈━━━━━━━━━━━━━━━━◈
 │❒ SUCCESS! 🎉
 
@@ -276,54 +276,48 @@ app.post('/pair', async (req, res) => {
 │❒ It should be ready in a few minutes.
 │❒ Thank you for using Toxic-MD! 🚀
 ◈━━━━━━━━━━━━━━━━◈
-              `
-            });
+                `
+              });
+              
+              console.log(`✅ All done for user ${userId}!`);
+              
+            } catch (deployError) {
+              console.error(`❌ Deployment failed for ${userId}:`, deployError);
+              await sock.sendMessage(sock.user.id, {
+                text: '❌ Deployment failed. Please try again later.'
+              });
+            }
+
+            // Close connection after delay
+            await delay(5000);
+            if (sock.ws && sock.ws.readyState !== sock.ws.CLOSED) {
+              sock.ws.close();
+            }
             
-            console.log(`✅ All done for user ${userId}!`);
-            
-          } catch (deployError) {
-            console.error(`❌ Deployment failed for ${userId}:`, deployError);
-            await sock.sendMessage(sock.user.id, {
-              text: '❌ Deployment failed. Please try again later.'
-            });
+            // Cleanup
+            setTimeout(() => {
+              removeFile(sessionPath);
+              activeSessions.delete(sessionId);
+            }, 10000);
+
+            resolve();
           }
-
-          // Close connection after delay
-          await delay(5000);
-          sock.ws.close();
-          
-          // Cleanup
-          setTimeout(() => {
-            removeFile(sessionPath);
-            activeSessions.delete(sessionId);
-          }, 10000);
-        }
-
-        // Handle disconnection
-        if (connection === 'close') {
-          console.log(`🔌 Connection closed for ${userId}`);
-          
-          if (lastDisconnect?.error?.output?.statusCode !== 401) {
-            console.log(`🔄 Connection lost for ${userId}, waiting for reconnect...`);
-          }
-        }
-      });
-
-    } catch (err) {
-      console.error(`❌ Pairing error for ${userId}:`, err);
-      removeFile(sessionPath);
-      activeSessions.delete(sessionId);
-      
-      if (!res.headersSent) {
-        res.status(500).json({ 
-          success: false,
-          error: 'Failed to generate pairing code. Please try again.' 
         });
-      }
+      });
+    }
+
+  } catch (err) {
+    console.error(`❌ Pairing error for ${userId}:`, err);
+    removeFile(sessionPath);
+    activeSessions.delete(sessionId);
+    
+    if (!res.headersSent) {
+      res.status(500).json({ 
+        success: false,
+        error: 'Failed to generate pairing code. Please try again.' 
+      });
     }
   }
-
-  await startPairing();
 });
 
 // Status endpoint
