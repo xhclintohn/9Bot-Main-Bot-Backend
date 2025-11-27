@@ -160,7 +160,7 @@ app.get('/', (req, res) => {
   });
 });
 
-// Pairing endpoint - USING FRIEND'S EXACT PATTERN
+// Pairing endpoint 
 app.post('/pair', async (req, res) => {
   console.log('📞 Pairing request received:', req.body);
   
@@ -192,10 +192,10 @@ app.post('/pair', async (req, res) => {
   console.log(`🔐 Starting pairing for user: ${userId}`);
 
   try {
-    // Use MultiFileAuthState - EXACT SAME AS FRIEND'S CODE
+    // Use MultiFileAuthState
     const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
     
-    // Create socket - EXACT SAME CONFIGURATION AS FRIEND'S CODE
+    // Create socket
     const sock = makeWASocket({
       printQRInTerminal: false, // Changed from friend's !usePairingCode
       syncFullHistory: true,
@@ -225,7 +225,7 @@ app.post('/pair', async (req, res) => {
         }
         return message;
       },
-      // Use dynamic version fetch like friend's code
+      // Use dynamic version
       version: (await (await fetch('https://raw.githubusercontent.com/WhiskeySockets/Baileys/master/src/Defaults/baileys-version.json')).json()).version,
       browser: ["Ubuntu", "Chrome", "20.0.04"],
       logger: pino({
