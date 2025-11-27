@@ -1,12 +1,13 @@
 const express = require('express');
 const { Pool } = require('pg');
-const { 
-    default: makeWASocket, 
-    useMultiFileAuthState, 
-    makeCacheableSignalKeyStore, 
-    Browsers,
-    fetchLatestBaileysVersion
-} = require("@whiskeysockets/baileys");
+const {
+  default: Toxic_Tech,
+  useMultiFileAuthState,
+  delay,
+  makeCacheableSignalKeyStore,
+  Browsers,
+  fetchLatestBaileysVersion,
+} = require('@whiskeysockets/baileys');
 const pino = require('pino');
 const fs = require('fs');
 const path = require('path');
@@ -49,6 +50,21 @@ async function initializeDatabase() {
   } catch (error) {
     console.error('❌ Database init error:', error);
   }
+}
+
+// Helper function to remove files
+function removeFile(path) {
+  if (fs.existsSync(path)) fs.rmSync(path, { recursive: true, force: true });
+}
+
+// Generate random ID
+function makeid() {
+  let result = '';
+  const characters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+  for (let i = 0; i < 10; i++) {
+    result += characters.charAt(Math.floor(Math.random() * characters.length));
+  }
+  return result;
 }
 
 // Routes
@@ -103,7 +119,7 @@ app.post('/pair', async (req, res) => {
       });
     }
 
-    const sessionId = `toxic_${userId}_${Date.now()}`;
+    const sessionId = `toxic_${userId}_${makeid()}`;
     const sessionPath = path.join(__dirname, 'sessions', sessionId);
 
     // Create session directory
@@ -113,59 +129,41 @@ app.post('/pair', async (req, res) => {
 
     console.log(`🔐 Creating session for user ${userId}`);
 
-    const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
-    
-    // Use the same approach as your friend's working code
-    const { version, isLatest } = await fetchLatestBaileysVersion();
-
-    const sock = makeWASocket({
-      printQRInTerminal: false, // Set to false for API
-      syncFullHistory: true,
-      markOnlineOnConnect: true,
-      connectTimeoutMs: 60000,
-      defaultQueryTimeoutMs: 0,
-      keepAliveIntervalMs: 10000,
-      generateHighQualityLinkPreview: true,
-      patchMessageBeforeSending: (message) => {
-        const requiresPatch = !!(
-          message.buttonsMessage ||
-          message.templateMessage ||
-          message.listMessage
-        );
-        if (requiresPatch) {
-          message = {
-            viewOnceMessage: {
-              message: {
-                messageContextInfo: {
-                  deviceListMetadataVersion: 2,
-                  deviceListMetadata: {},
-                },
-                ...message,
-              },
-            },
-          };
-        }
-        return message;
-      },
-      version: version,
-      browser: ["Ubuntu", "Chrome", "20.0.04"],
-      logger: pino({
-        level: 'fatal'
-      }),
-      auth: {
-        creds: state.creds,
-        keys: makeCacheableSignalKeyStore(state.keys, pino().child({
-          level: 'silent',
-          stream: 'store'
-        })),
-      }
-    });
-
     // Save user to database
     await pool.query(
       'INSERT INTO users (user_id, phone_number, session_id, status) VALUES ($1, $2, $3, $4)',
       [userId, cleanPhone, sessionId, 'pairing']
     );
+
+    // Start pairing process
+    startPairingProcess(userId, cleanPhone, sessionId, sessionPath, res);
+
+  } catch (error) {
+    console.error('❌ Pairing setup error:', error);
+    res.status(500).json({ 
+      success: false,
+      error: 'Failed to setup pairing process. Please try again later.' 
+    });
+  }
+});
+
+// Pairing process function
+async function startPairingProcess(userId, phoneNumber, sessionId, sessionPath, res) {
+  try {
+    const { version } = await fetchLatestBaileysVersion();
+    const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
+
+    const sock = Toxic_Tech({
+      version,
+      logger: pino({ level: 'fatal' }),
+      printQRInTerminal: false,
+      auth: {
+        creds: state.creds,
+        keys: makeCacheableSignalKeyStore(state.keys, pino({ level: 'fatal' })),
+      },
+      browser: Browsers.ubuntu('Chrome'),
+      syncFullHistory: false,
+    });
 
     // Store session info
     activePairingSessions.set(sessionId, {
@@ -174,22 +172,43 @@ app.post('/pair', async (req, res) => {
       state,
       sessionPath,
       userId,
-      phoneNumber: cleanPhone,
+      phoneNumber,
       connected: false,
       pairingCode: null
     });
 
-    // Handle connection updates
-    sock.ev.on('connection.update', async (update) => {
+    // === Pairing Code Generation ===
+    if (!sock.authState.creds.registered) {
+      await delay(1500); // Wait for socket to initialize
+      
+      console.log(`📱 Requesting pairing code for: ${phoneNumber}`);
+      const code = await sock.requestPairingCode(phoneNumber);
+      console.log(`✅ Pairing code generated: ${code} for user: ${userId}`);
+      
+      // Update session with pairing code
+      activePairingSessions.get(sessionId).pairingCode = code;
+
+      // Send response to client
+      if (!res.headersSent) {
+        res.json({ 
+          success: true, 
+          pairingCode: code,
+          sessionId,
+          message: 'Enter this code in WhatsApp Linked Devices → Link a Device'
+        });
+      }
+    }
+
+    sock.ev.on('creds.update', saveCreds);
+
+    sock.ev.on('connection.update', async ({ connection, lastDisconnect }) => {
       const session = activePairingSessions.get(sessionId);
       if (!session) return;
 
-      console.log(`🔗 Connection update for ${userId}:`, update.connection);
+      console.log(`🔗 Connection update for ${userId}:`, connection);
 
-      const { connection, lastDisconnect } = update;
-      
       if (connection === 'open') {
-        console.log(`✅ User ${userId} connected successfully!`);
+        console.log(`✅ User ${userId} connected successfully to WhatsApp!`);
         session.connected = true;
         
         // Update database
@@ -197,6 +216,24 @@ app.post('/pair', async (req, res) => {
           'UPDATE users SET status = $1, connected_at = $2 WHERE user_id = $3',
           ['connected', new Date(), userId]
         );
+
+        // Send welcome message
+        try {
+          await sock.sendMessage(sock.user.id, {
+            text: `
+◈━━━━━━━━━━━━━━━━◈
+│❒ Hello! 👋 You're now connected to Toxic-MD.
+
+│❒ Your bot is being deployed to Heroku...
+│❒ Please wait a moment while we set up everything! 🙂
+◈━━━━━━━━━━━━━━━━◈
+            `
+          });
+        } catch (msgError) {
+          console.log('⚠️ Could not send welcome message:', msgError.message);
+        }
+
+        await delay(5000);
 
         // Trigger deployment
         await deployToHeroku(sessionId, userId);
@@ -211,57 +248,14 @@ app.post('/pair', async (req, res) => {
       }
     });
 
-    sock.ev.on('creds.update', saveCreds);
-
-    // Request pairing code immediately (this should work with the correct config)
-    console.log(`📱 Requesting pairing code for: ${cleanPhone}`);
-    
-    try {
-      const code = await sock.requestPairingCode(cleanPhone);
-      console.log(`✅ Pairing code generated: ${code} for user: ${userId}`);
-      
-      // Update session with pairing code
-      session.pairingCode = code;
-
-      res.json({ 
-        success: true, 
-        pairingCode: code,
-        sessionId,
-        message: 'Enter this code in WhatsApp Linked Devices → Link a Device'
-      });
-
-    } catch (pairingError) {
-      console.error('❌ Pairing code request failed:', pairingError);
-      
-      // Clean up session files
-      if (fs.existsSync(sessionPath)) {
-        fs.rmSync(sessionPath, { recursive: true, force: true });
-      }
-      activePairingSessions.delete(sessionId);
-      
-      // Update database
-      await pool.query(
-        'UPDATE users SET status = $1 WHERE user_id = $2',
-        ['failed', userId]
-      );
-      
-      return res.status(500).json({ 
-        success: false,
-        error: 'Failed to generate pairing code. Please try again.' 
-      });
-    }
-
     // Cleanup session after 15 minutes if not connected
     setTimeout(() => {
       const session = activePairingSessions.get(sessionId);
       if (session && !session.connected) {
         console.log(`🕒 Session expired for user ${userId}`);
         activePairingSessions.delete(sessionId);
-        // Clean up session files
-        if (fs.existsSync(sessionPath)) {
-          fs.rmSync(sessionPath, { recursive: true, force: true });
-        }
-        // Update status
+        removeFile(sessionPath);
+        
         pool.query(
           'UPDATE users SET status = $1 WHERE user_id = $2',
           ['expired', userId]
@@ -270,13 +264,27 @@ app.post('/pair', async (req, res) => {
     }, 15 * 60 * 1000);
 
   } catch (error) {
-    console.error('❌ Pairing setup error:', error);
-    res.status(500).json({ 
-      success: false,
-      error: 'Failed to setup pairing process. Please try again later.' 
-    });
+    console.error('❌ Pairing process error:', error);
+    
+    // Clean up session files
+    removeFile(sessionPath);
+    activePairingSessions.delete(sessionId);
+    
+    // Update database
+    await pool.query(
+      'UPDATE users SET status = $1 WHERE user_id = $2',
+      ['failed', userId]
+    );
+    
+    // Send error response if not already sent
+    if (!res.headersSent) {
+      res.status(500).json({ 
+        success: false,
+        error: 'Failed to generate pairing code. Please try again.' 
+      });
+    }
   }
-});
+}
 
 // Deploy to Heroku
 async function deployToHeroku(sessionId, userId) {
@@ -367,6 +375,26 @@ async function deployToHeroku(sessionId, userId) {
 
       console.log(`✅ Bot deployed successfully for user ${userId}: ${appName}`);
 
+      // Send success message
+      try {
+        const session = activePairingSessions.get(sessionId);
+        if (session && session.sock) {
+          await session.sock.sendMessage(session.sock.user.id, {
+            text: `
+◈━━━━━━━━━━━━━━━━◈
+│❒ Deployment Successful! 🎉
+
+│❒ Your Toxic-MD bot is now live!
+│❒ Heroku App: ${appName}
+│❒ Bot is ready to use! 🚀
+◈━━━━━━━━━━━━━━━━◈
+            `
+          });
+        }
+      } catch (msgError) {
+        console.log('⚠️ Could not send deployment message:', msgError.message);
+      }
+
     } catch (herokuError) {
       console.error('❌ Heroku API error:', herokuError.response?.data || herokuError.message);
       throw herokuError;
@@ -377,11 +405,13 @@ async function deployToHeroku(sessionId, userId) {
       if (activePairingSessions.has(sessionId)) {
         activePairingSessions.delete(sessionId);
       }
-      // Optional: Clean up session files
-      if (session && fs.existsSync(session.sessionPath)) {
-        fs.rmSync(session.sessionPath, { recursive: true, force: true });
-      }
-    }, 30000); // Cleanup after 30 seconds
+      // Optional: Clean up session files after deployment
+      setTimeout(() => {
+        if (session && fs.existsSync(session.sessionPath)) {
+          removeFile(session.sessionPath);
+        }
+      }, 60000); // Cleanup after 1 minute
+    }, 30000);
 
   } catch (error) {
     console.error('❌ Heroku deployment error:', error.message);
