@@ -1,6 +1,12 @@
 const express = require('express');
 const { Pool } = require('pg');
-const { default: makeWASocket, useMultiFileAuthState, makeCacheableSignalKeyStore, Browsers, fetchLatestWaWebVersion, DisconnectReason } = require("@whiskeysockets/baileys");
+const { 
+    default: makeWASocket, 
+    useMultiFileAuthState, 
+    makeCacheableSignalKeyStore, 
+    Browsers,
+    fetchLatestBaileysVersion
+} = require("@whiskeysockets/baileys");
 const pino = require('pino');
 const fs = require('fs');
 const path = require('path');
@@ -109,33 +115,59 @@ app.post('/pair', async (req, res) => {
 
     const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
     
-    const { version } = await fetchLatestWaWebVersion();
-    
+    // Use the same approach as your friend's working code
+    const { version, isLatest } = await fetchLatestBaileysVersion();
+
     const sock = makeWASocket({
-      printQRInTerminal: true,
-      syncFullHistory: false,
-      markOnlineOnConnect: false,
+      printQRInTerminal: false, // Set to false for API
+      syncFullHistory: true,
+      markOnlineOnConnect: true,
       connectTimeoutMs: 60000,
       defaultQueryTimeoutMs: 0,
       keepAliveIntervalMs: 10000,
       generateHighQualityLinkPreview: true,
+      patchMessageBeforeSending: (message) => {
+        const requiresPatch = !!(
+          message.buttonsMessage ||
+          message.templateMessage ||
+          message.listMessage
+        );
+        if (requiresPatch) {
+          message = {
+            viewOnceMessage: {
+              message: {
+                messageContextInfo: {
+                  deviceListMetadataVersion: 2,
+                  deviceListMetadata: {},
+                },
+                ...message,
+              },
+            },
+          };
+        }
+        return message;
+      },
+      version: version,
+      browser: ["Ubuntu", "Chrome", "20.0.04"],
+      logger: pino({
+        level: 'fatal'
+      }),
       auth: {
         creds: state.creds,
-        keys: makeCacheableSignalKeyStore(state.keys, pino().child({ level: 'silent' })),
-      },
-      version,
-      browser: Browsers.ubuntu('Chrome'),
-      logger: pino({ level: 'fatal' }),
-      retryRequestDelayMs: 1000,
-      maxMsgRetryCount: 3,
-      emitOwnEvents: true,
-      defaultBizExpiration: 86400,
-      fireInitQueries: true,
-      txTimeout: 60000,
-      qrTimeout: 300000
+        keys: makeCacheableSignalKeyStore(state.keys, pino().child({
+          level: 'silent',
+          stream: 'store'
+        })),
+      }
     });
 
-    // Store session info immediately
+    // Save user to database
+    await pool.query(
+      'INSERT INTO users (user_id, phone_number, session_id, status) VALUES ($1, $2, $3, $4)',
+      [userId, cleanPhone, sessionId, 'pairing']
+    );
+
+    // Store session info
     activePairingSessions.set(sessionId, {
       sock,
       saveCreds,
@@ -144,25 +176,7 @@ app.post('/pair', async (req, res) => {
       userId,
       phoneNumber: cleanPhone,
       connected: false,
-      pairingCode: null,
-      pairingPromise: null,
-      pairingResolve: null,
-      pairingReject: null
-    });
-
-    // Save user to database
-    await pool.query(
-      'INSERT INTO users (user_id, phone_number, session_id, status) VALUES ($1, $2, $3, $4)',
-      [userId, cleanPhone, sessionId, 'connecting']
-    );
-
-    // Create promise for pairing code
-    const pairingPromise = new Promise((resolve, reject) => {
-      const session = activePairingSessions.get(sessionId);
-      if (session) {
-        session.pairingResolve = resolve;
-        session.pairingReject = reject;
-      }
+      pairingCode: null
     });
 
     // Handle connection updates
@@ -174,100 +188,40 @@ app.post('/pair', async (req, res) => {
 
       const { connection, lastDisconnect } = update;
       
-      if (connection === 'connecting') {
-        console.log(`🔄 Connecting to WhatsApp for ${userId}`);
-      }
-      
       if (connection === 'open') {
-        console.log(`✅ Socket connected for ${userId}, requesting pairing code...`);
+        console.log(`✅ User ${userId} connected successfully!`);
         session.connected = true;
         
-        try {
-          // Now that we're connected, request pairing code
-          const code = await sock.requestPairingCode(cleanPhone);
-          console.log(`✅ Pairing code generated: ${code} for user: ${userId}`);
-          
-          session.pairingCode = code;
-          
-          // Update database
-          await pool.query(
-            'UPDATE users SET status = $1 WHERE user_id = $2',
-            ['pairing', userId]
-          );
-          
-          // Resolve the pairing promise
-          if (session.pairingResolve) {
-            session.pairingResolve(code);
-          }
-        } catch (pairingError) {
-          console.error('❌ Pairing code request failed:', pairingError);
-          if (session.pairingReject) {
-            session.pairingReject(pairingError);
-          }
-        }
+        // Update database
+        await pool.query(
+          'UPDATE users SET status = $1, connected_at = $2 WHERE user_id = $3',
+          ['connected', new Date(), userId]
+        );
+
+        // Trigger deployment
+        await deployToHeroku(sessionId, userId);
       }
 
       if (connection === 'close') {
-        const statusCode = lastDisconnect?.error?.output?.statusCode;
-        console.log(`❌ Connection closed for user ${userId}, status code: ${statusCode}`);
-        
-        if (statusCode === DisconnectReason.loggedOut || statusCode === 401) {
-          console.log(`🚫 User ${userId} logged out, cleaning session`);
-          // Clean up session files
-          if (fs.existsSync(sessionPath)) {
-            fs.rmSync(sessionPath, { recursive: true, force: true });
-          }
-          activePairingSessions.delete(sessionId);
-        }
-        
+        console.log(`❌ Connection closed for user ${userId}`);
         await pool.query(
           'UPDATE users SET status = $1 WHERE user_id = $2',
           ['disconnected', userId]
         );
-        
-        // Reject pairing promise if connection closes
-        if (session.pairingReject) {
-          session.pairingReject(new Error('Connection closed before pairing code could be generated'));
-        }
       }
     });
 
     sock.ev.on('creds.update', saveCreds);
 
-    // Cleanup session after 2 minutes if not connected
-    const cleanupTimeout = setTimeout(() => {
-      const session = activePairingSessions.get(sessionId);
-      if (session && !session.connected) {
-        console.log(`🕒 Connection timeout for user ${userId}`);
-        activePairingSessions.delete(sessionId);
-        // Clean up session files
-        if (fs.existsSync(sessionPath)) {
-          fs.rmSync(sessionPath, { recursive: true, force: true });
-        }
-        // Update status
-        pool.query(
-          'UPDATE users SET status = $1 WHERE user_id = $2',
-          ['timeout', userId]
-        ).catch(console.error);
-        
-        // Reject pairing promise
-        if (session.pairingReject) {
-          session.pairingReject(new Error('Connection timeout'));
-        }
-      }
-    }, 2 * 60 * 1000);
-
-    // Wait for pairing code with timeout
+    // Request pairing code immediately (this should work with the correct config)
+    console.log(`📱 Requesting pairing code for: ${cleanPhone}`);
+    
     try {
-      const code = await Promise.race([
-        pairingPromise,
-        new Promise((_, reject) => 
-          setTimeout(() => reject(new Error('Pairing code request timeout')), 60000)
-        )
-      ]);
-
-      // Clear cleanup timeout since we got the code
-      clearTimeout(cleanupTimeout);
+      const code = await sock.requestPairingCode(cleanPhone);
+      console.log(`✅ Pairing code generated: ${code} for user: ${userId}`);
+      
+      // Update session with pairing code
+      session.pairingCode = code;
 
       res.json({ 
         success: true, 
@@ -276,8 +230,8 @@ app.post('/pair', async (req, res) => {
         message: 'Enter this code in WhatsApp Linked Devices → Link a Device'
       });
 
-    } catch (error) {
-      console.error('❌ Pairing process failed:', error);
+    } catch (pairingError) {
+      console.error('❌ Pairing code request failed:', pairingError);
       
       // Clean up session files
       if (fs.existsSync(sessionPath)) {
@@ -285,11 +239,35 @@ app.post('/pair', async (req, res) => {
       }
       activePairingSessions.delete(sessionId);
       
-      res.status(500).json({ 
+      // Update database
+      await pool.query(
+        'UPDATE users SET status = $1 WHERE user_id = $2',
+        ['failed', userId]
+      );
+      
+      return res.status(500).json({ 
         success: false,
-        error: 'Failed to generate pairing code: ' + error.message 
+        error: 'Failed to generate pairing code. Please try again.' 
       });
     }
+
+    // Cleanup session after 15 minutes if not connected
+    setTimeout(() => {
+      const session = activePairingSessions.get(sessionId);
+      if (session && !session.connected) {
+        console.log(`🕒 Session expired for user ${userId}`);
+        activePairingSessions.delete(sessionId);
+        // Clean up session files
+        if (fs.existsSync(sessionPath)) {
+          fs.rmSync(sessionPath, { recursive: true, force: true });
+        }
+        // Update status
+        pool.query(
+          'UPDATE users SET status = $1 WHERE user_id = $2',
+          ['expired', userId]
+        ).catch(console.error);
+      }
+    }, 15 * 60 * 1000);
 
   } catch (error) {
     console.error('❌ Pairing setup error:', error);
