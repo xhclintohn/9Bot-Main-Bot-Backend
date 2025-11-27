@@ -43,10 +43,23 @@ async function initializeDatabase() {
         heroku_app VARCHAR(255),
         connected_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         deployed_at TIMESTAMP,
-        status VARCHAR(50) DEFAULT 'pending',
-        pairing_code VARCHAR(10)
+        status VARCHAR(50) DEFAULT 'pending'
       )
     `);
+    
+    // Check if pairing_code column exists, if not add it
+    try {
+      await pool.query('SELECT pairing_code FROM users LIMIT 1');
+    } catch (error) {
+      if (error.code === '42703') { // column doesn't exist
+        console.log('📊 Adding pairing_code column to users table...');
+        await pool.query('ALTER TABLE users ADD COLUMN pairing_code VARCHAR(10)');
+        console.log('✅ pairing_code column added successfully');
+      } else {
+        throw error;
+      }
+    }
+    
     console.log('✅ Database initialized');
   } catch (error) {
     console.error('❌ Database init error:', error);
@@ -176,7 +189,7 @@ async function startPairingProcess(userId, phoneNumber, sessionId, sessionPath, 
       phoneNumber,
       connected: false,
       pairingCode: null,
-      waitingForPairing: true // New flag to track pairing state
+      waitingForPairing: true
     });
 
     // === Pairing Code Generation ===
@@ -192,11 +205,24 @@ async function startPairingProcess(userId, phoneNumber, sessionId, sessionPath, 
       session.pairingCode = code;
       session.waitingForPairing = true;
 
-      // Save pairing code to database
-      await pool.query(
-        'UPDATE users SET pairing_code = $1, status = $2 WHERE user_id = $3',
-        [code, 'waiting_for_pairing', userId]
-      );
+      try {
+        // Try to update with pairing_code column
+        await pool.query(
+          'UPDATE users SET pairing_code = $1, status = $2 WHERE user_id = $3',
+          [code, 'waiting_for_pairing', userId]
+        );
+      } catch (dbError) {
+        if (dbError.code === '42703') {
+          // If pairing_code column doesn't exist, update without it
+          console.log('⚠️ pairing_code column not found, updating status only');
+          await pool.query(
+            'UPDATE users SET status = $1 WHERE user_id = $2',
+            ['waiting_for_pairing', userId]
+          );
+        } else {
+          throw dbError;
+        }
+      }
 
       // Send response to client
       if (!res.headersSent) {
@@ -293,7 +319,7 @@ async function startPairingProcess(userId, phoneNumber, sessionId, sessionPath, 
           ['expired', userId]
         ).catch(console.error);
       }
-    }, 30 * 60 * 1000); // 30 minutes
+    }, 30 * 60 * 1000);
 
   } catch (error) {
     console.error('❌ Pairing process error:', error);
@@ -318,7 +344,7 @@ async function startPairingProcess(userId, phoneNumber, sessionId, sessionPath, 
   }
 }
 
-// Deploy to Heroku (same as before)
+// Deploy to Heroku
 async function deployToHeroku(sessionId, userId) {
   try {
     const session = activePairingSessions.get(sessionId);
@@ -442,7 +468,7 @@ async function deployToHeroku(sessionId, userId) {
         if (session && fs.existsSync(session.sessionPath)) {
           removeFile(session.sessionPath);
         }
-      }, 60000); // Cleanup after 1 minute
+      }, 60000);
     }, 30000);
 
   } catch (error) {
@@ -456,7 +482,7 @@ async function deployToHeroku(sessionId, userId) {
   }
 }
 
-// Check deployment status - IMPROVED
+// Check deployment status
 app.get('/status/:userId', async (req, res) => {
   try {
     const { userId } = req.params;
@@ -537,11 +563,11 @@ function getDisplayStatus(dbStatus, pairingStatus) {
   return statusMap[pairingStatus] || statusMap[dbStatus] || dbStatus;
 }
 
-// List all sessions (same as before)
+// List all sessions
 app.get('/sessions', async (req, res) => {
   try {
     const result = await pool.query(
-      'SELECT user_id, phone_number, heroku_app, status, connected_at, deployed_at, pairing_code FROM users ORDER BY connected_at DESC LIMIT 50'
+      'SELECT user_id, phone_number, heroku_app, status, connected_at, deployed_at FROM users ORDER BY connected_at DESC LIMIT 50'
     );
     
     res.json({ 
@@ -558,7 +584,60 @@ app.get('/sessions', async (req, res) => {
   }
 });
 
-// ... rest of the endpoints remain the same ...
+// Get active pairing sessions (admin endpoint)
+app.get('/admin/sessions', (req, res) => {
+  const activeSessions = Array.from(activePairingSessions.entries()).map(([sessionId, session]) => ({
+    sessionId,
+    userId: session.userId,
+    phoneNumber: session.phoneNumber,
+    connected: session.connected,
+    pairingCode: session.pairingCode
+  }));
+
+  res.json({
+    success: true,
+    activeSessions: activeSessions,
+    totalActive: activeSessions.length
+  });
+});
+
+// Cleanup endpoint (optional)
+app.delete('/cleanup', async (req, res) => {
+  try {
+    // Clean up old sessions from database
+    const result = await pool.query(
+      'DELETE FROM users WHERE connected_at < NOW() - INTERVAL \'7 days\' AND status != \'deployed\''
+    );
+    
+    res.json({
+      success: true,
+      message: `Cleaned up ${result.rowCount} old sessions`
+    });
+  } catch (error) {
+    console.error('❌ Cleanup error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Cleanup failed'
+    });
+  }
+});
+
+// Error handling middleware
+app.use((error, req, res, next) => {
+  console.error('🚨 Unhandled error:', error);
+  res.status(500).json({
+    success: false,
+    error: 'Internal server error'
+  });
+});
+
+// 404 handler
+app.use((req, res) => {
+  res.status(404).json({
+    success: false,
+    error: 'Endpoint not found'
+  });
+});
 
 // Start server
 app.listen(port, async () => {
