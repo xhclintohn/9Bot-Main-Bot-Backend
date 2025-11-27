@@ -1,7 +1,6 @@
 // index.js
 // Toxic-MD Pairing API (stable pairing edition)
 // Reworked to wait for connection.open before requesting pairing code.
-// Preserves your GitHub & Heroku deploy flow.
 
 const express = require('express');
 const fs = require('fs');
