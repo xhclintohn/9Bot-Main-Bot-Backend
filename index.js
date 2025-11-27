@@ -5,11 +5,15 @@ const pino = require('pino');
 const fs = require('fs');
 const path = require('path');
 const axios = require('axios');
-const { execSync } = require('child_process');
-const simpleGit = require('simple-git');
+const cors = require('cors');
 
 const app = express();
 const port = process.env.PORT || 3000;
+
+// Middleware
+app.use(cors());
+app.use(express.json());
+app.use(express.static('public'));
 
 // PostgreSQL connection
 const pool = new Pool({
@@ -17,23 +21,8 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false }
 });
 
-// Middleware
-app.use(express.json());
-app.use(express.static('public'));
-
 // Store active pairing sessions
 const activePairingSessions = new Map();
-const GITHUB_REPO_URL = 'https://github.com/thebitnomad/9bot';
-const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
-const HEROKU_API_KEY = process.env.HEROKU_API_KEY;
-
-// Clone and setup local repo
-const tempDir = path.join(__dirname, 'temp-repo');
-if (!fs.existsSync(tempDir)) {
-  fs.mkdirSync(tempDir, { recursive: true });
-}
-
-const git = simpleGit(tempDir);
 
 // Initialize database
 async function initializeDatabase() {
@@ -63,22 +52,36 @@ app.get('/', (req, res) => {
   res.json({ 
     status: 'Toxic-MD Pairing API', 
     version: '1.0',
+    message: 'Server is running!',
     endpoints: [
-      '/pair - Start pairing',
-      '/deploy/:userId - Trigger deployment',
-      '/status/:userId - Check status',
-      '/sessions - List all sessions'
+      'POST /pair - Start pairing',
+      'GET /status/:userId - Check status',
+      'GET /sessions - List all sessions'
     ]
   });
 });
 
 // Start pairing process
 app.post('/pair', async (req, res) => {
+  console.log('📞 Pairing request received:', req.body);
+  
   try {
     const { phoneNumber, userId } = req.body;
     
     if (!phoneNumber || !userId) {
-      return res.status(400).json({ error: 'Phone number and user ID required' });
+      return res.status(400).json({ 
+        success: false,
+        error: 'Phone number and user ID are required' 
+      });
+    }
+
+    // Validate phone number format
+    const cleanPhone = phoneNumber.replace(/[^0-9]/g, '');
+    if (!cleanPhone.startsWith('62')) {
+      return res.status(400).json({
+        success: false,
+        error: 'Phone number must start with 62 (Indonesia)'
+      });
     }
 
     // Check if user already exists
@@ -88,7 +91,10 @@ app.post('/pair', async (req, res) => {
     );
 
     if (existingUser.rows.length > 0) {
-      return res.status(400).json({ error: 'User ID already exists' });
+      return res.status(400).json({ 
+        success: false,
+        error: 'User ID already exists. Please choose a different one.' 
+      });
     }
 
     const sessionId = `toxic_${userId}_${Date.now()}`;
@@ -99,12 +105,14 @@ app.post('/pair', async (req, res) => {
       fs.mkdirSync(sessionPath, { recursive: true });
     }
 
+    console.log(`🔐 Creating session for user ${userId}`);
+
     const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
     
     const { version } = await fetchLatestWaWebVersion();
     
     const sock = makeWASocket({
-      printQRInTerminal: false,
+      printQRInTerminal: true,
       auth: {
         creds: state.creds,
         keys: makeCacheableSignalKeyStore(state.keys, pino().child({ level: 'silent' })),
@@ -115,7 +123,9 @@ app.post('/pair', async (req, res) => {
     });
 
     // Request pairing code
-    const code = await sock.requestPairingCode(phoneNumber.replace(/[^0-9]/g, ''));
+    console.log(`📱 Requesting pairing code for: ${cleanPhone}`);
+    const code = await sock.requestPairingCode(cleanPhone);
+    console.log(`✅ Pairing code generated: ${code} for user: ${userId}`);
     
     // Store session info
     activePairingSessions.set(sessionId, {
@@ -124,14 +134,15 @@ app.post('/pair', async (req, res) => {
       state,
       sessionPath,
       userId,
-      phoneNumber,
-      connected: false
+      phoneNumber: cleanPhone,
+      connected: false,
+      pairingCode: code
     });
 
     // Save user to database
     await pool.query(
       'INSERT INTO users (user_id, phone_number, session_id, status) VALUES ($1, $2, $3, $4)',
-      [userId, phoneNumber, sessionId, 'pairing']
+      [userId, cleanPhone, sessionId, 'pairing']
     );
 
     // Handle connection updates
@@ -139,8 +150,10 @@ app.post('/pair', async (req, res) => {
       const session = activePairingSessions.get(sessionId);
       if (!session) return;
 
+      console.log(`🔗 Connection update for ${userId}:`, update.connection);
+
       if (update.connection === 'open') {
-        console.log(`✅ User ${userId} connected successfully`);
+        console.log(`✅ User ${userId} connected successfully!`);
         session.connected = true;
         
         // Update database
@@ -149,100 +162,80 @@ app.post('/pair', async (req, res) => {
           ['connected', new Date(), userId]
         );
 
-        // Save credentials to GitHub and deploy
-        await saveCredsToGitHubAndDeploy(sessionId, userId);
+        // Trigger deployment
+        await deployToHeroku(sessionId, userId);
+      }
+
+      if (update.connection === 'close') {
+        console.log(`❌ Connection closed for user ${userId}`);
+        await pool.query(
+          'UPDATE users SET status = $1 WHERE user_id = $2',
+          ['disconnected', userId]
+        );
       }
     });
 
     sock.ev.on('creds.update', saveCreds);
 
+    // Cleanup session after 10 minutes if not connected
+    setTimeout(() => {
+      const session = activePairingSessions.get(sessionId);
+      if (session && !session.connected) {
+        console.log(`🕒 Session expired for user ${userId}`);
+        activePairingSessions.delete(sessionId);
+        // Clean up session files
+        if (fs.existsSync(sessionPath)) {
+          fs.rmSync(sessionPath, { recursive: true, force: true });
+        }
+      }
+    }, 10 * 60 * 1000);
+
     res.json({ 
       success: true, 
       pairingCode: code,
       sessionId,
-      message: 'Enter this code in WhatsApp Linked Devices'
+      message: 'Enter this code in WhatsApp Linked Devices → Link a Device'
     });
 
   } catch (error) {
     console.error('❌ Pairing error:', error);
-    res.status(500).json({ error: 'Failed to generate pairing code' });
+    res.status(500).json({ 
+      success: false,
+      error: 'Failed to generate pairing code: ' + error.message 
+    });
   }
 });
 
-// Save credentials to GitHub and trigger deployment
-async function saveCredsToGitHubAndDeploy(sessionId, userId) {
+// Deploy to Heroku
+async function deployToHeroku(sessionId, userId) {
   try {
     const session = activePairingSessions.get(sessionId);
-    if (!session) return;
+    if (!session) {
+      console.log(`❌ Session not found for deployment: ${sessionId}`);
+      return;
+    }
+
+    const HEROKU_API_KEY = process.env.HEROKU_API_KEY;
+    if (!HEROKU_API_KEY) {
+      console.error('❌ HEROKU_API_KEY not found in environment variables');
+      await pool.query(
+        'UPDATE users SET status = $1 WHERE user_id = $2',
+        ['deployment_failed', userId]
+      );
+      return;
+    }
 
     console.log(`🚀 Starting deployment for user: ${userId}`);
 
-    // Clone the repo
-    if (!fs.existsSync(path.join(tempDir, '.git'))) {
-      await git.clone(`https://${GITHUB_TOKEN}@github.com/thebitnomad/9bot.git`, '.');
-    } else {
-      await git.pull();
-    }
+    // Update status to deploying
+    await pool.query(
+      'UPDATE users SET status = $1 WHERE user_id = $2',
+      ['deploying', userId]
+    );
 
-    // Copy session files to repo
-    const sessionFiles = fs.readdirSync(session.sessionPath);
-    const repoSessionPath = path.join(tempDir, 'Session');
-    
-    if (!fs.existsSync(repoSessionPath)) {
-      fs.mkdirSync(repoSessionPath, { recursive: true });
-    }
+    const appName = `toxic-md-${userId}-${Date.now()}`.toLowerCase().replace(/[^a-z0-9-]/g, '').substring(0, 30);
 
-    // Copy all session files
-    for (const file of sessionFiles) {
-      const sourcePath = path.join(session.sessionPath, file);
-      const destPath = path.join(repoSessionPath, file);
-      fs.copyFileSync(sourcePath, destPath);
-    }
-
-    // Create app.json for this user
-    const appJson = {
-      name: `toxic-md-${userId}`,
-      description: "Toxic-MD WhatsApp Bot",
-      repository: GITHUB_REPO_URL,
-      env: {
-        USER_ID: {
-          value: userId,
-          required: true
-        }
-      },
-      addons: [
-        {
-          plan: "heroku-postgresql"
-        }
-      ],
-      buildpacks: [
-        { url: "heroku/nodejs" },
-        { url: "https://github.com/clhuang/heroku-buildpack-webp-binaries.git" },
-        { url: "https://github.com/jonathanong/heroku-buildpack-ffmpeg-latest" }
-      ]
-    };
-
-    fs.writeFileSync(path.join(tempDir, 'app.json'), JSON.stringify(appJson, null, 2));
-
-    // Commit and push to GitHub
-    await git.add('.');
-    await git.commit(`Add session for user ${userId}`);
-    await git.push('origin', 'main');
-
-    console.log(`✅ Credentials saved to GitHub for user: ${userId}`);
-
-    // Deploy to Heroku
-    await deployToHeroku(userId);
-
-  } catch (error) {
-    console.error('❌ GitHub save error:', error);
-  }
-}
-
-// Deploy to Heroku
-async function deployToHeroku(userId) {
-  try {
-    const appName = `toxic-md-${userId}-${Date.now()}`.toLowerCase().substring(0, 30);
+    console.log(`🔧 Creating Heroku app: ${appName}`);
 
     // Create Heroku app
     const createAppResponse = await axios.post(
@@ -257,11 +250,12 @@ async function deployToHeroku(userId) {
       }
     );
 
-    // Configure environment
+    // Configure environment variables
     await axios.patch(
       `https://api.heroku.com/apps/${appName}/config-vars`,
       {
-        USER_ID: userId
+        USER_ID: userId,
+        SESSION_ID: sessionId
       },
       {
         headers: {
@@ -272,13 +266,12 @@ async function deployToHeroku(userId) {
       }
     );
 
-    // Connect to GitHub and deploy
-    await axios.post(
+    // Build from GitHub (using your Toxic-MD repo)
+    const buildResponse = await axios.post(
       `https://api.heroku.com/apps/${appName}/builds`,
       {
         source_blob: {
-          url: `https://github.com/thebitnomad/9bot/tarball/main/`,
-          version: "main"
+          url: 'https://github.com/xhclintohn/Toxic-v2/tarball/main/'
         }
       },
       {
@@ -290,36 +283,33 @@ async function deployToHeroku(userId) {
       }
     );
 
-    // Update database
+    // Update database with deployment info
     await pool.query(
       'UPDATE users SET heroku_app = $1, deployed_at = $2, status = $3 WHERE user_id = $4',
       [appName, new Date(), 'deployed', userId]
     );
 
-    console.log(`✅ Bot deployed for user ${userId}: ${appName}`);
+    console.log(`✅ Bot deployed successfully for user ${userId}: ${appName}`);
 
-    // Cleanup: Remove session from GitHub after deployment
-    setTimeout(() => cleanupGitHubSession(userId), 60000);
+    // Cleanup session after successful deployment
+    setTimeout(() => {
+      if (activePairingSessions.has(sessionId)) {
+        activePairingSessions.delete(sessionId);
+      }
+      // Optional: Clean up session files
+      if (fs.existsSync(session.sessionPath)) {
+        fs.rmSync(session.sessionPath, { recursive: true, force: true });
+      }
+    }, 30000); // Cleanup after 30 seconds
 
   } catch (error) {
-    console.error('❌ Heroku deployment error:', error);
+    console.error('❌ Heroku deployment error:', error.response?.data || error.message);
+    
+    // Update status to failed
     await pool.query(
       'UPDATE users SET status = $1 WHERE user_id = $2',
       ['deployment_failed', userId]
     );
-  }
-}
-
-// Cleanup GitHub session
-async function cleanupGitHubSession(userId) {
-  try {
-    // Reset repo to remove session files
-    await git.reset(['--hard', 'HEAD~1']); // Revert last commit
-    await git.push('origin', 'main', ['--force']);
-    
-    console.log(`✅ Cleaned up GitHub session for user: ${userId}`);
-  } catch (error) {
-    console.error('❌ GitHub cleanup error:', error);
   }
 }
 
@@ -334,12 +324,34 @@ app.get('/status/:userId', async (req, res) => {
     );
 
     if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'User not found' });
+      return res.status(404).json({ 
+        success: false,
+        error: 'User not found' 
+      });
     }
 
-    res.json({ user: result.rows[0] });
+    const user = result.rows[0];
+    
+    // Check if session is still active
+    const session = activePairingSessions.get(user.session_id);
+    if (session) {
+      user.session_active = true;
+      user.pairing_code = session.pairingCode;
+    } else {
+      user.session_active = false;
+    }
+
+    res.json({ 
+      success: true,
+      user: user 
+    });
+
   } catch (error) {
-    res.status(500).json({ error: 'Failed to get status' });
+    console.error('❌ Status check error:', error);
+    res.status(500).json({ 
+      success: false,
+      error: 'Failed to get status' 
+    });
   }
 });
 
@@ -347,40 +359,82 @@ app.get('/status/:userId', async (req, res) => {
 app.get('/sessions', async (req, res) => {
   try {
     const result = await pool.query(
-      'SELECT user_id, phone_number, heroku_app, status, connected_at, deployed_at FROM users ORDER BY connected_at DESC'
+      'SELECT user_id, phone_number, heroku_app, status, connected_at, deployed_at FROM users ORDER BY connected_at DESC LIMIT 50'
     );
     
     res.json({ 
+      success: true,
       total: result.rows.length,
       sessions: result.rows 
     });
   } catch (error) {
-    res.status(500).json({ error: 'Failed to get sessions' });
+    console.error('❌ Sessions list error:', error);
+    res.status(500).json({ 
+      success: false,
+      error: 'Failed to get sessions' 
+    });
   }
 });
 
-// Manual deployment trigger
-app.post('/deploy/:userId', async (req, res) => {
+// Get active pairing sessions (admin endpoint)
+app.get('/admin/sessions', (req, res) => {
+  const activeSessions = Array.from(activePairingSessions.entries()).map(([sessionId, session]) => ({
+    sessionId,
+    userId: session.userId,
+    phoneNumber: session.phoneNumber,
+    connected: session.connected,
+    pairingCode: session.pairingCode
+  }));
+
+  res.json({
+    success: true,
+    activeSessions: activeSessions,
+    totalActive: activeSessions.length
+  });
+});
+
+// Cleanup endpoint (optional)
+app.delete('/cleanup', async (req, res) => {
   try {
-    const { userId } = req.params;
+    // Clean up old sessions from database
+    const result = await pool.query(
+      'DELETE FROM users WHERE connected_at < NOW() - INTERVAL \'7 days\' AND status != \'deployed\''
+    );
     
-    const session = Array.from(activePairingSessions.values())
-      .find(s => s.userId === userId && s.connected);
-
-    if (!session) {
-      return res.status(404).json({ error: 'No active connected session found' });
-    }
-
-    await saveCredsToGitHubAndDeploy(session.sessionId, userId);
-    res.json({ success: true, message: 'Deployment triggered' });
-
+    res.json({
+      success: true,
+      message: `Cleaned up ${result.rowCount} old sessions`
+    });
   } catch (error) {
-    res.status(500).json({ error: 'Deployment failed' });
+    console.error('❌ Cleanup error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Cleanup failed'
+    });
   }
+});
+
+// Error handling middleware
+app.use((error, req, res, next) => {
+  console.error('🚨 Unhandled error:', error);
+  res.status(500).json({
+    success: false,
+    error: 'Internal server error'
+  });
+});
+
+// 404 handler
+app.use((req, res) => {
+  res.status(404).json({
+    success: false,
+    error: 'Endpoint not found'
+  });
 });
 
 // Start server
 app.listen(port, async () => {
   await initializeDatabase();
   console.log(`🚀 Toxic-MD Pairing API running on port ${port}`);
+  console.log(`🔗 Health check: http://localhost:${port}/`);
+  console.log(`📱 Pairing endpoint: POST http://localhost:${port}/pair`);
 });
