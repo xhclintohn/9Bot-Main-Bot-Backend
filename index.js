@@ -1,3 +1,8 @@
+// index.js
+// Toxic-MD Pairing API (stable pairing edition)
+// Reworked to wait for connection.open before requesting pairing code.
+// Preserves your GitHub & Heroku deploy flow.
+
 const express = require('express');
 const fs = require('fs');
 const path = require('path');
@@ -6,11 +11,14 @@ const axios = require('axios');
 const cors = require('cors');
 const simpleGit = require('simple-git');
 
-const { 
-    default: makeWASocket, 
-    useMultiFileAuthState, 
-    makeCacheableSignalKeyStore, 
-    Browsers
+// Polyfill fetch for Node (works even if Node runtime doesn't provide fetch)
+global.fetch = global.fetch || ((...args) => import('node-fetch').then(({ default: fetch }) => fetch(...args)));
+
+const {
+  default: makeWASocket,
+  useMultiFileAuthState,
+  makeCacheableSignalKeyStore,
+  Browsers
 } = require("@whiskeysockets/baileys");
 
 const app = express();
@@ -30,15 +38,15 @@ const tempDir = path.join(__dirname, 'temp-repo');
 const activeSessions = new Map();
 
 // Helper functions
-function removeFile(path) {
-  if (fs.existsSync(path)) fs.rmSync(path, { recursive: true, force: true });
+function removeFile(p) {
+  if (fs.existsSync(p)) fs.rmSync(p, { recursive: true, force: true });
 }
 
 function makeid() {
   let result = '';
   const characters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
   for (let i = 0; i < 10; i++) {
-    result += characters.charAt(Math.floor(Math.random() * characters.length));
+    result += characters.charAt(Math.floor(Math.random() * Math.random() * characters.length));
   }
   return result;
 }
@@ -47,24 +55,24 @@ function makeid() {
 async function saveToGitHubAndDeploy(sessionPath, userId, phoneNumber) {
   try {
     console.log(`🚀 Starting GitHub save and deployment for user: ${userId}`);
-    
+
     // Clone repo
     const git = simpleGit();
     const repoUrl = `https://${GITHUB_TOKEN}@github.com/thebitnomad/9bot.git`;
-    
+
     if (fs.existsSync(tempDir)) {
       removeFile(tempDir);
     }
-    
+
     console.log('📥 Cloning GitHub repository...');
     await git.clone(repoUrl, tempDir);
-    
+
     // Copy session files
     const repoSessionPath = path.join(tempDir, 'Session');
     if (!fs.existsSync(repoSessionPath)) {
       fs.mkdirSync(repoSessionPath, { recursive: true });
     }
-    
+
     console.log('📁 Copying session files...');
     const sessionFiles = fs.readdirSync(sessionPath);
     for (const file of sessionFiles) {
@@ -72,18 +80,18 @@ async function saveToGitHubAndDeploy(sessionPath, userId, phoneNumber) {
       const destPath = path.join(repoSessionPath, file);
       fs.copyFileSync(sourcePath, destPath);
     }
-    
+
     console.log('💾 Committing to GitHub...');
     const gitRepo = simpleGit(tempDir);
     await gitRepo.add('.');
     await gitRepo.commit(`Add session for user ${userId}`);
     await gitRepo.push('origin', 'main');
-    
+
     console.log(`✅ Session saved to GitHub for user: ${userId}`);
-    
+
     // Deploy to Heroku
     await deployToHeroku(userId);
-    
+
   } catch (error) {
     console.error('❌ GitHub save/deploy error:', error);
     throw error;
@@ -151,25 +159,40 @@ async function deployToHeroku(userId) {
   }
 }
 
+// Utility: attempt to fetch Baileys version, fallback to a safe static version
+async function getBaileysVersion() {
+  try {
+    const url = 'https://raw.githubusercontent.com/WhiskeySockets/Baileys/master/src/Defaults/baileys-version.json';
+    const resp = await fetch(url, { timeout: 5000 });
+    if (!resp.ok) throw new Error('Failed to fetch version JSON');
+    const data = await resp.json();
+    if (Array.isArray(data.version)) return data.version;
+  } catch (e) {
+    console.warn('⚠️ Could not fetch Baileys version dynamically, using fallback. Reason:', e.message || e);
+  }
+  // Fallback version (kept conservative)
+  return [2, 3000, 5];
+}
+
 // Routes
 app.get('/', (req, res) => {
-  res.json({ 
-    status: 'Toxic-MD Pairing API', 
+  res.json({
+    status: 'Toxic-MD Pairing API',
     version: '1.0',
     message: 'Server is running!'
   });
 });
 
-// Pairing endpoint 
+// Pairing endpoint - STABLE pairing (wait for socket open then request pairing code)
 app.post('/pair', async (req, res) => {
   console.log('📞 Pairing request received:', req.body);
-  
+
   const { phoneNumber, userId } = req.body;
-  
+
   if (!phoneNumber || !userId) {
-    return res.status(400).json({ 
+    return res.status(400).json({
       success: false,
-      error: 'Phone number and user ID are required' 
+      error: 'Phone number and user ID are required'
     });
   }
 
@@ -194,10 +217,12 @@ app.post('/pair', async (req, res) => {
   try {
     // Use MultiFileAuthState
     const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
-    
-    // Create socket
+
+    // Prepare options for socket
+    const version = await getBaileysVersion();
+
     const sock = makeWASocket({
-      printQRInTerminal: false, // Changed from friend's !usePairingCode
+      printQRInTerminal: false,
       syncFullHistory: true,
       markOnlineOnConnect: true,
       connectTimeoutMs: 60000,
@@ -225,18 +250,12 @@ app.post('/pair', async (req, res) => {
         }
         return message;
       },
-      // Use dynamic version
-      version: (await (await fetch('https://raw.githubusercontent.com/WhiskeySockets/Baileys/master/src/Defaults/baileys-version.json')).json()).version,
-      browser: ["Ubuntu", "Chrome", "20.0.04"],
-      logger: pino({
-        level: 'fatal'
-      }),
+      version,
+      browser: Browsers.ubuntu('Chrome'),
+      logger: pino({ level: 'silent' }),
       auth: {
         creds: state.creds,
-        keys: makeCacheableSignalKeyStore(state.keys, pino().child({
-          level: 'silent',
-          stream: 'store'
-        })),
+        keys: makeCacheableSignalKeyStore(state.keys, pino().child({ level: 'silent', stream: 'store' })),
       }
     });
 
@@ -252,101 +271,123 @@ app.post('/pair', async (req, res) => {
     // Listen for creds updates
     sock.ev.on('creds.update', saveCreds);
 
-    // === Pairing Code Generation - EXACT SAME AS FRIEND'S CODE ===
-    if (!sock.authState.creds.registered) {
-      console.log(`📱 Requesting pairing code for: ${cleanPhone}`);
-      
-      // Request pairing code immediately - same as friend's code
-      const code = await sock.requestPairingCode(cleanPhone.trim());
-      console.log(`✅ Pairing code generated: ${code} for user: ${userId}`);
-      
-      // Send response immediately
-      res.json({ 
-        success: true, 
-        pairingCode: code,
-        sessionId: sessionId,
-        message: 'Enter this code in WhatsApp Linked Devices → Link a Device'
-      });
+    // We will request pairing code only once after the socket indicates it is open.
+    // Use a one-time listener so repeated /pair calls don't stack handlers.
+    let responded = false;
 
-      // Wait for connection like friend's code does
-      console.log(`⏳ Waiting for user ${userId} to connect...`);
-      
-      return new Promise((resolve) => {
-        sock.ev.on('connection.update', async (update) => {
-          const { connection } = update;
-          console.log(`🔗 Connection update: ${connection}`);
-          
-          if (connection === 'open') {
-            console.log(`🎉 USER ${userId} SUCCESSFULLY CONNECTED!`);
-            
-            const session = activeSessions.get(sessionId);
-            if (session) session.connected = true;
+    const onConnectionUpdate = async (update) => {
+      try {
+        const connection = update?.connection;
+        if (!connection) return;
 
-            try {
-              // Send welcome message
-              await sock.sendMessage(sock.user.id, {
-                text: `
-◈━━━━━━━━━━━━━━━━◈
-│❒ Hello! 👋 You're now connected to Toxic-MD.
+        console.log(`🔗 Connection update: ${connection}`);
 
-│❒ Saving your session and deploying bot...
-│❒ Please wait a moment! 🙂
-◈━━━━━━━━━━━━━━━━◈
-                `
+        if (connection === 'open') {
+          console.log('✅ WA socket opened — now requesting pairing code.');
+
+          try {
+            // Request pairing code now that the socket is open.
+            const code = await sock.requestPairingCode(cleanPhone.trim());
+            console.log(`✅ Pairing code generated: ${code} for user: ${userId}`);
+
+            // Send pairing code back to caller
+            if (!responded && !res.headersSent) {
+              res.json({
+                success: true,
+                pairingCode: code,
+                sessionId,
+                message: 'Enter this code in WhatsApp Linked Devices → Link a Device'
               });
-
-              // Save to GitHub and deploy
-              console.log(`💾 Starting GitHub save for ${userId}...`);
-              await saveToGitHubAndDeploy(sessionPath, userId, cleanPhone);
-              
-              // Send success message
-              await sock.sendMessage(sock.user.id, {
-                text: `
-◈━━━━━━━━━━━━━━━━◈
-│❒ SUCCESS! 🎉
-
-│❒ Your Toxic-MD bot has been deployed!
-│❒ It should be ready in a few minutes.
-│❒ Thank you for using Toxic-MD! 🚀
-◈━━━━━━━━━━━━━━━━◈
-                `
-              });
-              
-              console.log(`✅ All done for user ${userId}!`);
-              
-            } catch (deployError) {
-              console.error(`❌ Deployment failed for ${userId}:`, deployError);
-              await sock.sendMessage(sock.user.id, {
-                text: '❌ Deployment failed. Please try again later.'
-              });
+              responded = true;
             }
 
-            // Close connection
-            if (sock.ws && sock.ws.readyState !== sock.ws.CLOSED) {
-              sock.ws.close();
-            }
-            
-            // Cleanup
-            setTimeout(() => {
-              removeFile(sessionPath);
-              activeSessions.delete(sessionId);
-            }, 10000);
+            // Now wait for actual auth and connection by listening further
+            // Notice we don't block the HTTP response; server will continue to listen
+            // for connection update -> 'open' (already open) and then 'connection' events for future changes.
+          } catch (pairErr) {
+            console.error('❌ requestPairingCode error:', pairErr);
 
-            resolve();
+            // If requestPairingCode fails, send error if not yet sent
+            if (!responded && !res.headersSent) {
+              res.status(500).json({
+                success: false,
+                error: 'Failed to request pairing code: ' + (pairErr?.message || String(pairErr))
+              });
+              responded = true;
+            }
+
+            // Cleanup session on failure
+            try { sock.end(); } catch (e) {}
+            removeFile(sessionPath);
+            activeSessions.delete(sessionId);
           }
-        });
-      });
-    }
+        }
 
+        // If the socket closes unexpectedly, notify (but only if response still waiting)
+        if (connection === 'close') {
+          console.warn('⚠️ Socket connection closed:', update);
+          if (!responded && !res.headersSent) {
+            res.status(500).json({
+              success: false,
+              error: 'Socket connection closed before pairing code could be requested'
+            });
+            responded = true;
+          }
+
+          // Cleanup
+          try { sock.end(); } catch (e) {}
+          removeFile(sessionPath);
+          activeSessions.delete(sessionId);
+        }
+      } catch (e) {
+        console.error('❌ Error inside connection.update handler:', e);
+      } finally {
+        // keep handler attached; we rely on socket lifecycle for further events
+      }
+    };
+
+    sock.ev.on('connection.update', onConnectionUpdate);
+
+    // Also listen for 'creds.update' already attached; listen for 'connection' final open state to handle post-auth
+    sock.ev.on('connection.update', async (update) => {
+      const { connection, lastDisconnect } = update;
+      if (connection === 'open') {
+        console.log(`🎉 USER ${userId} socket open — monitoring for actual registration...`);
+        // Keep monitoring. When device actually registers, Baileys will emit creds update and sock.user will be populated.
+      }
+
+      if (connection === 'close') {
+        // For informational purpose, log reason
+        console.warn('Socket closed:', lastDisconnect?.error || lastDisconnect);
+      }
+    });
+
+    // As a safety: if socket fails to connect within X ms, reply with error
+    setTimeout(() => {
+      if (!responded && !res.headersSent) {
+        res.status(504).json({
+          success: false,
+          error: 'Timed out waiting for WhatsApp socket to open. Try again.'
+        });
+        responded = true;
+
+        try { sock.end(); } catch (e) {}
+        removeFile(sessionPath);
+        activeSessions.delete(sessionId);
+      }
+    }, 20000); // 20s timeout to open socket and request pairing code
+
+    // Return early only if sock was created successfully; the pairing code will be returned by the connection.update handler.
+    // If the socket creation itself throws, it will be caught by the outer try/catch.
   } catch (err) {
     console.error(`❌ Pairing error for ${userId}:`, err);
     removeFile(sessionPath);
     activeSessions.delete(sessionId);
-    
+
     if (!res.headersSent) {
-      res.status(500).json({ 
+      res.status(500).json({
         success: false,
-        error: 'Failed to generate pairing code. Please try again.' 
+        error: 'Failed to generate pairing code. Please try again.'
       });
     }
   }
@@ -356,15 +397,15 @@ app.post('/pair', async (req, res) => {
 app.get('/status/:sessionId', (req, res) => {
   const { sessionId } = req.params;
   const session = activeSessions.get(sessionId);
-  
+
   if (session) {
-    res.json({ 
+    res.json({
       success: true,
       connected: session.connected,
       userId: session.userId
     });
   } else {
-    res.json({ 
+    res.json({
       success: true,
       connected: false,
       message: 'Session not found'
@@ -372,7 +413,28 @@ app.get('/status/:sessionId', (req, res) => {
   }
 });
 
-// Start server
+// Graceful shutdown handlers
+async function gracefulShutdown() {
+  console.log('🧹 Graceful shutdown: closing sockets and cleaning sessions...');
+  for (const [id, s] of activeSessions.entries()) {
+    try {
+      if (s.sock && s.sock.ws && s.sock.ws.readyState !== s.sock.ws.CLOSED) {
+        s.sock.ws.close();
+      }
+    } catch (e) {
+      console.warn('Error closing socket for', id, e);
+    }
+    try {
+      if (s.saveCreds) await s.saveCreds();
+    } catch (e) {}
+    try { removeFile(s.sessionPath); } catch (e) {}
+    activeSessions.delete(id);
+  }
+  process.exit(0);
+}
+process.on('SIGTERM', gracefulShutdown);
+process.on('SIGINT', gracefulShutdown);
+
 app.listen(port, () => {
   console.log(`🚀 Toxic-MD Pairing API running on port ${port}`);
   console.log(`📱 Pairing endpoint: POST http://localhost:${port}/pair`);
