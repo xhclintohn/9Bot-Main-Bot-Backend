@@ -9,6 +9,7 @@ const pino = require('pino');
 const axios = require('axios');
 const cors = require('cors');
 const simpleGit = require('simple-git');
+const crypto = require('crypto');
 
 // Polyfill fetch for Node (works even if Node runtime doesn't provide fetch)
 global.fetch = global.fetch || ((...args) => import('node-fetch').then(({ default: fetch }) => fetch(...args)));
@@ -42,12 +43,8 @@ function removeFile(p) {
 }
 
 function makeid() {
-  let result = '';
-  const characters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
-  for (let i = 0; i < 10; i++) {
-    result += characters.charAt(Math.floor(Math.random() * Math.random() * characters.length));
-  }
-  return result;
+  // use crypto to generate a short collision-resistant id
+  return crypto.randomBytes(6).toString('hex').slice(0, 10);
 }
 
 // Clone and push to GitHub
@@ -158,18 +155,46 @@ async function deployToHeroku(userId) {
   }
 }
 
-// Utility: attempt to fetch Baileys version, fallback to a safe static version
-async function getBaileysVersion() {
+// Utility: fetch with timeout using AbortController
+async function fetchWithTimeout(url, opts = {}, timeout = 5000) {
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort(), timeout);
   try {
-    const url = 'https://raw.githubusercontent.com/WhiskeySockets/Baileys/master/src/Defaults/baileys-version.json';
-    const resp = await fetch(url, { timeout: 5000 });
-    if (!resp.ok) throw new Error('Failed to fetch version JSON');
-    const data = await resp.json();
-    if (Array.isArray(data.version)) return data.version;
+    const res = await fetch(url, { ...opts, signal: controller.signal });
+    clearTimeout(id);
+    return res;
   } catch (e) {
-    console.warn('⚠️ Could not fetch Baileys version dynamically, using fallback. Reason:', e.message || e);
+    clearTimeout(id);
+    throw e;
   }
-  // Fallback version (kept conservative)
+}
+
+// Utility: attempt to fetch latest WhatsApp web version (try a couple sources), fallback to safe static version
+async function getLatestWhatsappVersion() {
+  const fallbacks = [
+    { url: 'https://raw.githubusercontent.com/WhiskeySockets/WhatsAppWeb-JS/master/WHATSAPP_VERSION.json' },
+    { url: 'https://raw.githubusercontent.com/WhiskeySockets/Baileys/master/src/Defaults/baileys-version.json' }
+  ];
+
+  for (const src of fallbacks) {
+    try {
+      const resp = await fetchWithTimeout(src.url, {}, 5000);
+      if (!resp.ok) {
+        console.warn(`⚠️ fetch ${src.url} returned status ${resp.status}`);
+        continue;
+      }
+      const data = await resp.json();
+      // Try to get 'version' field or top-level array
+      if (Array.isArray(data.version)) return data.version;
+      if (Array.isArray(data)) return data;
+      // If object contains version array at root
+      if (Array.isArray(data?.version)) return data.version;
+    } catch (e) {
+      console.warn(`⚠️ Could not fetch from ${src.url}:`, e?.message || e);
+    }
+  }
+
+  console.warn('⚠️ Using fallback WhatsApp version [2,3000,5]');
   return [2, 3000, 5];
 }
 
@@ -211,14 +236,14 @@ app.post('/pair', async (req, res) => {
     fs.mkdirSync(sessionPath, { recursive: true });
   }
 
-  console.log(`🔐 Starting pairing for user: ${userId}`);
+  console.log(`🔐 Starting pairing for user: ${userId} (session: ${sessionId})`);
 
   try {
     // Use MultiFileAuthState
     const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
 
     // Prepare options for socket
-    const version = await getBaileysVersion();
+    const version = await getLatestWhatsappVersion();
 
     const sock = makeWASocket({
       printQRInTerminal: false,
@@ -300,13 +325,10 @@ app.post('/pair', async (req, res) => {
               responded = true;
             }
 
-            // Now wait for actual auth and connection by listening further
-            // Notice we don't block the HTTP response; server will continue to listen
-            // for connection update -> 'open' (already open) and then 'connection' events for future changes.
+            // Keep the socket alive and monitor for final registration.
           } catch (pairErr) {
             console.error('❌ requestPairingCode error:', pairErr);
 
-            // If requestPairingCode fails, send error if not yet sent
             if (!responded && !res.headersSent) {
               res.status(500).json({
                 success: false,
@@ -340,29 +362,26 @@ app.post('/pair', async (req, res) => {
         }
       } catch (e) {
         console.error('❌ Error inside connection.update handler:', e);
-      } finally {
-        // keep handler attached; we rely on socket lifecycle for further events
       }
     };
 
     sock.ev.on('connection.update', onConnectionUpdate);
 
-    // Also listen for 'creds.update' already attached; listen for 'connection' final open state to handle post-auth
+    // Also listen for 'connection.update' for logging and lastDisconnect reason
     sock.ev.on('connection.update', async (update) => {
       const { connection, lastDisconnect } = update;
       if (connection === 'open') {
         console.log(`🎉 USER ${userId} socket open — monitoring for actual registration...`);
-        // Keep monitoring. When device actually registers, Baileys will emit creds update and sock.user will be populated.
       }
 
       if (connection === 'close') {
-        // For informational purpose, log reason
         console.warn('Socket closed:', lastDisconnect?.error || lastDisconnect);
       }
     });
 
     // As a safety: if socket fails to connect within X ms, reply with error
-    setTimeout(() => {
+    const PAIR_TIMEOUT_MS = 20000; // Keep this less than Heroku router timeout (usually 30s)
+    const t = setTimeout(() => {
       if (!responded && !res.headersSent) {
         res.status(504).json({
           success: false,
@@ -374,10 +393,20 @@ app.post('/pair', async (req, res) => {
         removeFile(sessionPath);
         activeSessions.delete(sessionId);
       }
-    }, 20000); // 20s timeout to open socket and request pairing code
+    }, PAIR_TIMEOUT_MS);
 
-    // Return early only if sock was created successfully; the pairing code will be returned by the connection.update handler.
-    // If the socket creation itself throws, it will be caught by the outer try/catch.
+    // Clear timeout if response sent early or socket closed later
+    const cleanupTimeoutOnResponse = () => {
+      try { clearTimeout(t); } catch (e) {}
+    };
+
+    // Hook to clear timeout when response is sent
+    const originalResJson = res.json;
+    res.json = function () {
+      cleanupTimeoutOnResponse();
+      return originalResJson.apply(this, arguments);
+    };
+
   } catch (err) {
     console.error(`❌ Pairing error for ${userId}:`, err);
     removeFile(sessionPath);
