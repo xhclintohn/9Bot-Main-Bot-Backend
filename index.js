@@ -1,6 +1,6 @@
 const express = require('express');
 const { Pool } = require('pg');
-const { default: makeWASocket, useMultiFileAuthState, makeCacheableSignalKeyStore, Browsers, fetchLatestWaWebVersion } = require("@whiskeysockets/baileys");
+const { default: makeWASocket, useMultiFileAuthState, makeCacheableSignalKeyStore, Browsers, fetchLatestWaWebVersion, DisconnectReason } = require("@whiskeysockets/baileys");
 const pino = require('pino');
 const fs = require('fs');
 const path = require('path');
@@ -75,12 +75,12 @@ app.post('/pair', async (req, res) => {
       });
     }
 
-    // Validate phone number format
+    // Validate phone number format - allow all country codes
     const cleanPhone = phoneNumber.replace(/[^0-9]/g, '');
-    if (!cleanPhone.startsWith('254')) {
+    if (cleanPhone.length < 8) {
       return res.status(400).json({
         success: false,
-        error: 'Phone number must start with 62 (Indonesia)'
+        error: 'Please enter a valid phone number'
       });
     }
 
@@ -113,19 +113,48 @@ app.post('/pair', async (req, res) => {
     
     const sock = makeWASocket({
       printQRInTerminal: true,
+      syncFullHistory: false,
+      markOnlineOnConnect: false,
+      connectTimeoutMs: 60000,
+      defaultQueryTimeoutMs: 0,
+      keepAliveIntervalMs: 10000,
+      generateHighQualityLinkPreview: true,
       auth: {
         creds: state.creds,
         keys: makeCacheableSignalKeyStore(state.keys, pino().child({ level: 'silent' })),
       },
       version,
       browser: Browsers.ubuntu('Chrome'),
-      logger: pino({ level: 'silent' })
+      logger: pino({ level: 'fatal' }),
+      retryRequestDelayMs: 1000,
+      maxMsgRetryCount: 3,
+      emitOwnEvents: true,
+      defaultBizExpiration: 86400,
+      fireInitQueries: true,
+      txTimeout: 60000,
+      qrTimeout: 300000
     });
 
     // Request pairing code
     console.log(`📱 Requesting pairing code for: ${cleanPhone}`);
-    const code = await sock.requestPairingCode(cleanPhone);
-    console.log(`✅ Pairing code generated: ${code} for user: ${userId}`);
+    
+    let code;
+    try {
+      code = await sock.requestPairingCode(cleanPhone);
+      console.log(`✅ Pairing code generated: ${code} for user: ${userId}`);
+    } catch (pairingError) {
+      console.error('❌ Pairing code request failed:', pairingError);
+      
+      // Clean up session files
+      if (fs.existsSync(sessionPath)) {
+        fs.rmSync(sessionPath, { recursive: true, force: true });
+      }
+      
+      return res.status(500).json({ 
+        success: false,
+        error: 'Failed to generate pairing code. Please try again.' 
+      });
+    }
     
     // Store session info
     activePairingSessions.set(sessionId, {
@@ -152,7 +181,9 @@ app.post('/pair', async (req, res) => {
 
       console.log(`🔗 Connection update for ${userId}:`, update.connection);
 
-      if (update.connection === 'open') {
+      const { connection, lastDisconnect } = update;
+      
+      if (connection === 'open') {
         console.log(`✅ User ${userId} connected successfully!`);
         session.connected = true;
         
@@ -166,8 +197,19 @@ app.post('/pair', async (req, res) => {
         await deployToHeroku(sessionId, userId);
       }
 
-      if (update.connection === 'close') {
-        console.log(`❌ Connection closed for user ${userId}`);
+      if (connection === 'close') {
+        const statusCode = lastDisconnect?.error?.output?.statusCode;
+        console.log(`❌ Connection closed for user ${userId}, status code: ${statusCode}`);
+        
+        if (statusCode === DisconnectReason.loggedOut || statusCode === 401) {
+          console.log(`🚫 User ${userId} logged out, cleaning session`);
+          // Clean up session files
+          if (fs.existsSync(sessionPath)) {
+            fs.rmSync(sessionPath, { recursive: true, force: true });
+          }
+          activePairingSessions.delete(sessionId);
+        }
+        
         await pool.query(
           'UPDATE users SET status = $1 WHERE user_id = $2',
           ['disconnected', userId]
@@ -177,7 +219,18 @@ app.post('/pair', async (req, res) => {
 
     sock.ev.on('creds.update', saveCreds);
 
-    // Cleanup session after 10 minutes if not connected
+    // Handle connection errors
+    sock.ev.on('connection.update', (update) => {
+      if (update.qr) {
+        console.log(`🔄 QR code generated for ${userId}`);
+      }
+      
+      if (update.connection === 'connecting') {
+        console.log(`🔄 Connecting to WhatsApp for ${userId}`);
+      }
+    });
+
+    // Cleanup session after 15 minutes if not connected
     setTimeout(() => {
       const session = activePairingSessions.get(sessionId);
       if (session && !session.connected) {
@@ -187,8 +240,13 @@ app.post('/pair', async (req, res) => {
         if (fs.existsSync(sessionPath)) {
           fs.rmSync(sessionPath, { recursive: true, force: true });
         }
+        // Update status
+        pool.query(
+          'UPDATE users SET status = $1 WHERE user_id = $2',
+          ['expired', userId]
+        ).catch(console.error);
       }
-    }, 10 * 60 * 1000);
+    }, 15 * 60 * 1000);
 
     res.json({ 
       success: true, 
@@ -201,7 +259,7 @@ app.post('/pair', async (req, res) => {
     console.error('❌ Pairing error:', error);
     res.status(500).json({ 
       success: false,
-      error: 'Failed to generate pairing code: ' + error.message 
+      error: 'Failed to generate pairing code. Please try again later.' 
     });
   }
 });
@@ -237,59 +295,68 @@ async function deployToHeroku(sessionId, userId) {
 
     console.log(`🔧 Creating Heroku app: ${appName}`);
 
-    // Create Heroku app
-    const createAppResponse = await axios.post(
-      'https://api.heroku.com/apps',
-      { name: appName },
-      {
-        headers: {
-          'Authorization': `Bearer ${HEROKU_API_KEY}`,
-          'Accept': 'application/vnd.heroku+json; version=3',
-          'Content-Type': 'application/json'
+    try {
+      // Create Heroku app
+      const createAppResponse = await axios.post(
+        'https://api.heroku.com/apps',
+        { name: appName },
+        {
+          headers: {
+            'Authorization': `Bearer ${HEROKU_API_KEY}`,
+            'Accept': 'application/vnd.heroku+json; version=3',
+            'Content-Type': 'application/json'
+          },
+          timeout: 30000
         }
-      }
-    );
+      );
 
-    // Configure environment variables
-    await axios.patch(
-      `https://api.heroku.com/apps/${appName}/config-vars`,
-      {
-        USER_ID: userId,
-        SESSION_ID: sessionId
-      },
-      {
-        headers: {
-          'Authorization': `Bearer ${HEROKU_API_KEY}`,
-          'Accept': 'application/vnd.heroku+json; version=3',
-          'Content-Type': 'application/json'
+      // Configure environment variables
+      await axios.patch(
+        `https://api.heroku.com/apps/${appName}/config-vars`,
+        {
+          USER_ID: userId,
+          SESSION_ID: sessionId
+        },
+        {
+          headers: {
+            'Authorization': `Bearer ${HEROKU_API_KEY}`,
+            'Accept': 'application/vnd.heroku+json; version=3',
+            'Content-Type': 'application/json'
+          },
+          timeout: 30000
         }
-      }
-    );
+      );
 
-    // Build from GitHub (using your Toxic-MD repo)
-    const buildResponse = await axios.post(
-      `https://api.heroku.com/apps/${appName}/builds`,
-      {
-        source_blob: {
-          url: 'https://github.com/xhclintohn/Toxic-v2/tarball/main/'
+      // Build from GitHub (using your Toxic-MD repo)
+      const buildResponse = await axios.post(
+        `https://api.heroku.com/apps/${appName}/builds`,
+        {
+          source_blob: {
+            url: 'https://github.com/xhclintohn/Toxic-v2/tarball/main/'
+          }
+        },
+        {
+          headers: {
+            'Authorization': `Bearer ${HEROKU_API_KEY}`,
+            'Accept': 'application/vnd.heroku+json; version=3',
+            'Content-Type': 'application/json'
+          },
+          timeout: 60000
         }
-      },
-      {
-        headers: {
-          'Authorization': `Bearer ${HEROKU_API_KEY}`,
-          'Accept': 'application/vnd.heroku+json; version=3',
-          'Content-Type': 'application/json'
-        }
-      }
-    );
+      );
 
-    // Update database with deployment info
-    await pool.query(
-      'UPDATE users SET heroku_app = $1, deployed_at = $2, status = $3 WHERE user_id = $4',
-      [appName, new Date(), 'deployed', userId]
-    );
+      // Update database with deployment info
+      await pool.query(
+        'UPDATE users SET heroku_app = $1, deployed_at = $2, status = $3 WHERE user_id = $4',
+        [appName, new Date(), 'deployed', userId]
+      );
 
-    console.log(`✅ Bot deployed successfully for user ${userId}: ${appName}`);
+      console.log(`✅ Bot deployed successfully for user ${userId}: ${appName}`);
+
+    } catch (herokuError) {
+      console.error('❌ Heroku API error:', herokuError.response?.data || herokuError.message);
+      throw herokuError;
+    }
 
     // Cleanup session after successful deployment
     setTimeout(() => {
@@ -297,13 +364,13 @@ async function deployToHeroku(sessionId, userId) {
         activePairingSessions.delete(sessionId);
       }
       // Optional: Clean up session files
-      if (fs.existsSync(session.sessionPath)) {
+      if (session && fs.existsSync(session.sessionPath)) {
         fs.rmSync(session.sessionPath, { recursive: true, force: true });
       }
     }, 30000); // Cleanup after 30 seconds
 
   } catch (error) {
-    console.error('❌ Heroku deployment error:', error.response?.data || error.message);
+    console.error('❌ Heroku deployment error:', error.message);
     
     // Update status to failed
     await pool.query(
