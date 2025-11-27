@@ -38,7 +38,7 @@ const GITHUB_REPO = 'https://github.com/thebitnomad/9bot.git';
 const activePairingSessions = new Map();
 const tempDir = path.join(__dirname, 'temp-repo');
 
-// Initialize database
+// Initialize database - FIXED SCHEMA
 async function initializeDatabase() {
   try {
     await pool.query(`
@@ -52,6 +52,23 @@ async function initializeDatabase() {
         deployed_at TIMESTAMP
       )
     `);
+    
+    // Check and remove session_id column if it exists
+    try {
+      await pool.query('SELECT session_id FROM users LIMIT 1');
+      // If we get here, session_id column exists - drop it
+      console.log('🗑️ Removing old session_id column...');
+      await pool.query('ALTER TABLE users DROP COLUMN session_id');
+      console.log('✅ session_id column removed');
+    } catch (error) {
+      if (error.code === '42703') {
+        // Column doesn't exist - that's fine
+        console.log('✅ No session_id column found');
+      } else {
+        throw error;
+      }
+    }
+    
     console.log('✅ Database initialized');
   } catch (error) {
     console.error('❌ Database init error:', error);
@@ -224,7 +241,7 @@ app.get('/', (req, res) => {
   });
 });
 
-// Start pairing process
+// Start pairing process - FIXED DATABASE INSERT
 app.post('/pair', async (req, res) => {
   console.log('📞 Pairing request received:', req.body);
   
@@ -259,8 +276,7 @@ app.post('/pair', async (req, res) => {
       });
     }
 
-    const sessionId = `toxic_${userId}_${makeid()}`;
-    const sessionPath = path.join(__dirname, 'sessions', sessionId);
+    const sessionPath = path.join(__dirname, 'sessions', `toxic_${userId}_${makeid()}`);
 
     // Create session directory
     if (!fs.existsSync(sessionPath)) {
@@ -269,7 +285,7 @@ app.post('/pair', async (req, res) => {
 
     console.log(`🔐 Creating session for user ${userId}`);
 
-    // Save user to database
+    // Save user to database - FIXED: No session_id column
     await pool.query(
       'INSERT INTO users (user_id, phone_number, status) VALUES ($1, $2, $3)',
       [userId, cleanPhone, 'pairing']
